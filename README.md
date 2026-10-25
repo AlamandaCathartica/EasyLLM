@@ -9,7 +9,7 @@ A simple chat interface for running **LLMs up to 13B** on a small GPU. It runs i
 ## What it does
 
 **Load**
-- Ready-made presets from 3B to 13B, or paste any Hugging Face link (for example `https://huggingface.co/mlabonne/Daredevil-8B-abliterated`).
+- Ready-made presets from 3B to 13B, or paste any Hugging Face link (for example `https://huggingface.co/allenai/SERA-8B`).
 - fp16, 8-bit or 4-bit (NF4). A live estimate tells you whether the model fits your GPU before you press Load.
 - Gated models work with a Hugging Face token (Colab secret `HF_TOKEN`, or the field in Settings).
 

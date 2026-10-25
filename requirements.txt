@@ -1,0 +1,5 @@
+# Installed by the Colab launcher. torch ships with Colab; install it yourself when running locally.
+transformers>=4.45
+accelerate>=0.34
+bitsandbytes>=0.43
+flask>=2.3

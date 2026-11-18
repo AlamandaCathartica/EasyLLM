@@ -242,18 +242,25 @@ def _preflight(model_id, quant, token, gpu_total_gib):
     except Exception as e:  # noqa: BLE001
         log(f"Preflight: could not read the model config ({type(e).__name__}); continuing", "warn")
     size = n_params = 0
+    gguf_only = False
     try:
         from huggingface_hub import HfApi
 
         info = HfApi().model_info(model_id, token=token, files_metadata=True)
         files = [(f.rfilename, f.size or 0) for f in (info.siblings or [])]
         st = [x for x in files if x[0].endswith(".safetensors")]
+        gguf_only = not st and not any(x[0].endswith(".bin") for x in files) and any(x[0].endswith(".gguf") for x in files)
         main = [x for x in st if os.path.basename(x[0]).startswith("model")]  # skip e.g. consolidated.safetensors
         pick = main or st or [x for x in files if x[0].endswith(".bin")]
         size = sum(x[1] for x in pick)
         n_params = (getattr(getattr(info, "safetensors", None), "total", 0) or 0)
     except Exception as e:  # noqa: BLE001
         log(f"Preflight: could not read the repo file list ({type(e).__name__}); continuing", "warn")
+    if gguf_only:
+        base = re.sub(r"[-_.]?(i1[-_.])?GGUF$", "", model_id, flags=re.I)
+        raise RuntimeError(
+            f"{model_id} is a GGUF repo (llama.cpp format), which this loader can't run. Use a safetensors repo instead: "
+            f"the original model (e.g. {base}) with the 4bit setting, or an AWQ/bitsandbytes-4bit upload of it.")
     n_params = n_params or _guess_params(model_id)
     if prequant:
         need = size / GIB * 1.02 if size else (n_params * BPP["4bit"] / GIB)

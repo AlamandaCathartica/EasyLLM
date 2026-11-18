@@ -1,4 +1,4 @@
-"""EasyLLM: a chat GUI for running 4-bit / 8-bit / fp16 Hugging Face models (up to ~13B) on a small GPU.
+"""EasyLLM: a chat GUI for running 4-bit / 8-bit / fp16 Hugging Face models (up to ~32B in 4-bit on a 24 GB+ GPU).
 
     python gui/easyllm_gui.py                 local, opens http://127.0.0.1:7860
     python gui/easyllm_gui.py --demo          fake model, no GPU needed
@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import secrets
+import shutil
 import threading
 import time
 import warnings
@@ -18,6 +19,10 @@ from importlib import metadata
 
 from flask import Flask, Response, g, jsonify, request, send_file
 
+# Fewer fragmentation OOMs when a 32B model leaves only a few GiB of headroom. Must be set before torch starts CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WEB = os.path.join(HERE, "web")
@@ -25,6 +30,8 @@ DEMO = os.environ.get("EASYLLM_DEMO") == "1"
 DEMO_SLOW = float(os.environ.get("EASYLLM_DEMO_SLOW", "1"))  # demo only: stretch fake load times
 ACCESS_KEY = os.environ.get("EASYLLM_KEY", "")
 GIB = 1024 ** 3
+BPP = {"fp16": 2.0, "8bit": 1.1, "4bit": 0.62}  # approx. bytes per parameter incl. quant overhead (same as the web page)
+KV_RESERVE = 1.5 * GIB  # VRAM kept free for prefill activations on top of the KV cache
 try:
     VERSION = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
 except OSError:
@@ -172,7 +179,10 @@ def friendly(e):
     s = str(e)
     n = type(e).__name__
     if "out of memory" in s.lower() or n == "OutOfMemoryError":
-        return "Out of GPU memory. Use 4-bit, pick a smaller model, or lower max new tokens."
+        return ("Out of GPU memory. Use 4-bit, pick a smaller model, lower max new tokens, or clear the chat "
+                "(a 32B model in 4-bit needs a 24 GB+ GPU such as L4 or A100).")
+    if type(e) is RuntimeError:  # our own messages (preflight, context limit): already readable
+        return s
     if "401" in s or "gated" in s.lower() or "GatedRepoError" in n:
         return "This model is gated. Accept its license on Hugging Face and add an HF token (Colab secret HF_TOKEN or the Advanced field)."
     if "404" in s or "RepositoryNotFound" in n:
@@ -188,6 +198,16 @@ def _ver(pkg):
 
 
 # ------------------------------------------------------------------------ engine
+def _compute_dtype(torch):
+    """bf16 where the GPU has it (L4/A100/H100: safer for Qwen-style 32B models), fp16 on a T4."""
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except Exception:  # noqa: BLE001
+        pass
+    return torch.float16
+
+
 def _dtype_kw(torch):
     """transformers >= 4.56 renamed torch_dtype to dtype; pass whichever this version understands."""
     try:
@@ -197,7 +217,74 @@ def _dtype_kw(torch):
         key = "dtype" if Version(transformers.__version__) >= Version("4.56") else "torch_dtype"
     except Exception:  # noqa: BLE001
         key = "torch_dtype"
-    return {key: torch.float16}
+    return {key: _compute_dtype(torch)}
+
+
+def _guess_params(name):
+    m = re.search(r"(?:^|[^a-zA-Z0-9.])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])", name.split("/")[-1])
+    return float(m.group(1)) * 1e9 if m else 0.0
+
+
+def _preflight(model_id, quant, token, gpu_total_gib):
+    """Before downloading tens of GB: will the weights fit in VRAM, and is there enough disk? Raises RuntimeError if not.
+    Returns True when the repo is already quantized (bitsandbytes 4-bit checkpoint). Network errors here are not fatal."""
+    prequant = False
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, token=token)
+        prequant = getattr(cfg, "quantization_config", None) is not None
+        if not prequant and hasattr(cfg, "text_config"):
+            prequant = getattr(cfg.text_config, "quantization_config", None) is not None
+    except Exception as e:  # noqa: BLE001
+        log(f"Preflight: could not read the model config ({type(e).__name__}); continuing", "warn")
+    size = n_params = 0
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(model_id, token=token, files_metadata=True)
+        files = [(f.rfilename, f.size or 0) for f in (info.siblings or [])]
+        st = [x for x in files if x[0].endswith(".safetensors")]
+        main = [x for x in st if os.path.basename(x[0]).startswith("model")]  # skip e.g. consolidated.safetensors
+        pick = main or st or [x for x in files if x[0].endswith(".bin")]
+        size = sum(x[1] for x in pick)
+        n_params = (getattr(getattr(info, "safetensors", None), "total", 0) or 0)
+    except Exception as e:  # noqa: BLE001
+        log(f"Preflight: could not read the repo file list ({type(e).__name__}); continuing", "warn")
+    n_params = n_params or _guess_params(model_id)
+    if prequant:
+        need = size / GIB * 1.02 if size else (n_params * BPP["4bit"] / GIB)
+        how = "pre-quantized checkpoint"
+    elif n_params:
+        need = n_params * BPP[quant] / GIB
+        how = f"{n_params / 1e9:.1f}B params in {quant}"
+    else:
+        need, how = 0.0, ""
+    if need and gpu_total_gib:
+        need += 0.8
+        log(f"Preflight: needs about {need:.1f} GiB VRAM ({how}); GPU has {gpu_total_gib:.1f} GiB")
+        if need > gpu_total_gib * 0.97:
+            raise RuntimeError(
+                f"Won't fit: needs about {need:.1f} GiB but the GPU has {gpu_total_gib:.1f} GiB. "
+                "A 32B model in 4-bit needs a 24 GB+ GPU (Colab L4 or A100). Pick a smaller model or switch the runtime.")
+    if size:
+        try:
+            from huggingface_hub import constants
+
+            d = constants.HF_HUB_CACHE
+            while not os.path.exists(d) and os.path.dirname(d) != d:
+                d = os.path.dirname(d)
+            free = shutil.disk_usage(d).free
+            log(f"Preflight: download {size / GIB:.1f} GiB, free disk {free / GIB:.1f} GiB")
+            if size * 1.02 > free:
+                raise RuntimeError(
+                    f"Not enough disk: the download is {size / GIB:.1f} GiB but only {free / GIB:.1f} GiB is free. "
+                    "Prefer a pre-quantized '-bnb-4bit' repo (about a third of the size), or enable Google Drive caching.")
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+    return prequant
 
 
 class Engine:
@@ -215,6 +302,7 @@ class Engine:
         self.was_stopped = False
         self.lock = threading.Lock()
         self.gen = {"prompt": 0, "tokens": 0, "tps": 0.0, "elapsed": 0.0, "max": 0}
+        self.kv_per_tok = 0  # bytes of KV cache per token, set after load
         self._demo_vram = 0.35
 
     # ---- hardware
@@ -226,12 +314,13 @@ class Engine:
 
             if not torch.cuda.is_available():
                 return {"name": "No GPU", "total": 0.0, "used": 0.0}
-            free, total = torch.cuda.mem_get_info()
-            return {
-                "name": torch.cuda.get_device_properties(0).name,
-                "total": total / GIB,
-                "used": (total - free) / GIB,
-            }
+            free = total = 0
+            n = torch.cuda.device_count()
+            for i in range(n):
+                f, t = torch.cuda.mem_get_info(i)
+                free, total = free + f, total + t
+            name = torch.cuda.get_device_properties(0).name + (f" x{n}" if n > 1 else "")
+            return {"name": name, "total": total / GIB, "used": (total - free) / GIB}
         except Exception:
             return {"name": "Unknown", "total": 0.0, "used": 0.0}
 
@@ -266,6 +355,7 @@ class Engine:
             import torch
 
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         except Exception:
             pass
 
@@ -294,24 +384,45 @@ class Engine:
                 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
                 token = token or os.environ.get("HF_TOKEN") or None
+                if not torch.cuda.is_available():
+                    raise RuntimeError("No GPU found. In Colab choose Runtime > Change runtime type > a GPU (L4 or A100 for 32B).")
+                cdtype = _compute_dtype(torch)
+                self.phase = "Checking memory and disk"
+                prequant = _preflight(model_id, quant, token, self.gpu()["total"])
                 self.phase = "Loading tokenizer"
                 tok = AutoTokenizer.from_pretrained(model_id, token=token)
                 if tok.pad_token is None:
                     tok.pad_token = tok.eos_token
-                kw = dict(device_map="cuda", token=token, **_dtype_kw(torch))  # T4: fp16, no bf16
-                if quant == "4bit":
+                n_gpu = torch.cuda.device_count()
+                kw = dict(token=token, low_cpu_mem_usage=True, **_dtype_kw(torch))
+                if n_gpu > 1:  # e.g. 2x T4: spread layers, leave ~1.5 GiB per card for activations
+                    kw["device_map"] = "auto"
+                    kw["max_memory"] = {i: f"{max(1, int(torch.cuda.mem_get_info(i)[0] / GIB - 1.5))}GiB" for i in range(n_gpu)}
+                else:
+                    kw["device_map"] = {"": 0}  # everything on the GPU, never silently offloaded to slow CPU RAM
+                if prequant:
+                    if quant != "4bit":
+                        log(f"{model_id} is already 4-bit quantized; ignoring the {quant} setting", "warn")
+                    # its saved quantization_config is used as is
+                elif quant == "4bit":
                     kw["quantization_config"] = BitsAndBytesConfig(
                         load_in_4bit=True,
                         bnb_4bit_quant_type="nf4",
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,   # saves ~0.4 bit/param (about 1.6 GiB at 32B)
+                        bnb_4bit_compute_dtype=cdtype,
                     )
                 elif quant == "8bit":
                     kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
                 self.phase = "Downloading and loading weights"
+                log(f"Compute dtype {str(cdtype).replace('torch.', '')}, {n_gpu} GPU(s)")
                 model = AutoModelForCausalLM.from_pretrained(model_id, **kw)
                 model.eval()
                 self.tok, self.model = tok, model
+                self.kv_per_tok = self._kv_bytes_per_token(model, cdtype)
+                self._free_cache()
+                cap = self._ctx_cap()
+                if cap:
+                    log(f"KV cache costs {self.kv_per_tok / 1024:.0f} KiB/token; about {cap} tokens of context fit in the free VRAM")
             self.load_secs = time.time() - self.load_t0
             self.phase = ""
             self.status = "ready"
@@ -321,11 +432,47 @@ class Engine:
             self.status, self.error, self.phase = "error", friendly(e), ""
             log(f"Load failed: {self.error}", "error")
 
+    @staticmethod
+    def _kv_bytes_per_token(model, dtype):
+        try:
+            c = model.config
+            c = getattr(c, "text_config", None) or c
+            heads = c.num_attention_heads
+            kv_heads = getattr(c, "num_key_value_heads", None) or heads
+            hd = getattr(c, "head_dim", None) or c.hidden_size // heads
+            return 2 * c.num_hidden_layers * kv_heads * hd * (4 if dtype == "fp32" else 2)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    @staticmethod
+    def _free_cache():
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ctx_cap(self):
+        """How many tokens (prompt + reply) fit in the VRAM that is free right now. 0 = unknown."""
+        if not self.kv_per_tok:
+            return 0
+        try:
+            import torch
+
+            self._free_cache()
+            free = sum(torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count()))
+            free -= KV_RESERVE * torch.cuda.device_count()
+            return max(0, int(free / self.kv_per_tok))
+        except Exception:  # noqa: BLE001
+            return 0
+
     def unload(self):
         with self.lock:
             if self.status in ("loading", "generating"):
                 raise RuntimeError("Busy. Stop generation first.")
             self._free()
+            self.kv_per_tok = 0
             self.status, self.error, self.phase, self.model_id = "idle", "", "", ""
         log("Model unloaded")
 
@@ -344,6 +491,8 @@ class Engine:
             self.stop_flag.set()  # also stops the worker if the client disconnected
             if self.status == "generating":
                 self.status = "ready"
+            if not DEMO:
+                self._free_cache()  # hand the KV cache back so the next turn (or a recovery after OOM) starts clean
 
     def _demo_stream(self, messages, p):
         last = messages[-1]["content"].lower()
@@ -408,8 +557,13 @@ class Engine:
         inputs = self._inputs(messages)
         n_prompt = int(inputs["input_ids"].shape[1])
         ctx = getattr(self.model.config, "max_position_embeddings", 4096) or 4096
+        cap = self._ctx_cap()  # limited by free VRAM, which is what runs out first with a 32B model
+        if cap:
+            ctx = min(ctx, cap)
         if n_prompt >= ctx - 16:
-            raise RuntimeError(f"Conversation is too long for this model ({n_prompt} tokens). Clear the chat.")
+            raise RuntimeError(
+                f"Conversation is too long for the {ctx} tokens this model can hold in the free VRAM "
+                f"({n_prompt} tokens used). Clear the chat or start a new one.")
         max_new = max(16, min(int(p.get("max_new_tokens", 512)), ctx - n_prompt))
         streamer = Counting(self.tok, skip_prompt=True, skip_special_tokens=True)
         kw = dict(

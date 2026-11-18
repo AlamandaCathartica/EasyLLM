@@ -3,3 +3,6 @@ transformers>=4.45
 accelerate>=0.34
 bitsandbytes>=0.43
 flask>=2.3
+huggingface_hub>=0.24
+hf_transfer>=0.1.6
+packaging

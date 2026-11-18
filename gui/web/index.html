@@ -676,6 +676,11 @@ const PRESETS = [
   ["12B to 13B  (4-bit only)", [
     ["mistralai/Mistral-Nemo-Instruct-2407", "Mistral Nemo 12B Instruct", 12.2],
     ["NousResearch/Llama-2-13b-chat-hf", "Llama 2 13B Chat", 13.0]]],
+  ["30B to 32B  (4-bit, needs a 24 GB+ GPU: Colab L4 or A100)", [
+    ["unsloth/Qwen2.5-32B-Instruct-bnb-4bit", "Qwen2.5 32B Instruct, pre-quantized (~19 GB download)", 32.8],
+    ["unsloth/QwQ-32B-bnb-4bit", "QwQ 32B reasoning, pre-quantized (~19 GB download)", 32.8],
+    ["unsloth/DeepSeek-R1-Distill-Qwen-32B-bnb-4bit", "DeepSeek R1 Distill Qwen 32B, pre-quantized", 32.8],
+    ["Qwen/Qwen2.5-32B-Instruct", "Qwen2.5 32B Instruct, original (~65 GB download)", 32.8]]],
 ];
 const FLAT = PRESETS.flatMap((g) => g[1]);
 const BPP = { fp16: 2.0, "8bit": 1.1, "4bit": 0.62 };   // approx. bytes per parameter incl. quant overhead
@@ -806,9 +811,10 @@ function fit() {
   $("#resolved").style.color = cfg.custom.trim() && !rp ? "var(--md-sys-color-error)" : "";
   const el = $("#fit"), p = params(), tot = ST.gpu.total || 14.6;
   if (!p) { el.className = "banner info t-body"; el.textContent = rp ? "Size unknown from the name. Use 4-bit if it is 7B or larger." : ""; return; }
-  const gb = (p * 1e9 * BPP[cfg.quant]) / GIB + 0.8;
+  const q = /bnb-4bit/i.test(modelId()) ? "4bit" : cfg.quant;   // pre-quantized repos are always 4-bit
+  const gb = (p * 1e9 * BPP[q]) / GIB + 0.8;
   const head = `Estimated ${gb.toFixed(1)} GiB of ${tot.toFixed(1)} GiB`;
-  if (gb > tot * 0.97) { el.className = "banner error t-body"; el.textContent = `${head}. This will not fit. Use 4-bit or a smaller model.`; }
+  if (gb > tot * 0.97) { el.className = "banner error t-body"; el.textContent = `${head}. This will not fit. Use 4-bit, a smaller model${p >= 30 ? ", or switch the Colab runtime to an L4 or A100 GPU" : ""}.`; }
   else if (gb > tot * 0.8) { el.className = "banner warn t-body"; el.textContent = `${head}. Tight: long chats may run out of memory.`; }
   else { el.className = "banner info t-body"; el.textContent = `${head}. Fits, with room for context.`; }
 }

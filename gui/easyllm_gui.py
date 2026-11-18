@@ -181,6 +181,9 @@ def friendly(e):
     if "out of memory" in s.lower() or n == "OutOfMemoryError":
         return ("Out of GPU memory. Use 4-bit, pick a smaller model, lower max new tokens, or clear the chat "
                 "(a 32B model in 4-bit needs a 24 GB+ GPU such as L4 or A100).")
+    if "compressed-tensors" in s and "pip install" in s:
+        return (s + " In Colab, run that command in a cell, then Runtime > Restart session and start EasyLLM again "
+                "(the notebook installs it automatically on a fresh run).")
     if type(e) is RuntimeError:  # our own messages (preflight, context limit): already readable
         return s
     if "401" in s or "gated" in s.lower() or "GatedRepoError" in n:
